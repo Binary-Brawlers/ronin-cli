@@ -12,6 +12,14 @@ curl -fsSL https://raw.githubusercontent.com/Binary-Brawlers/ronin-cli/main/inst
 
 The installer downloads the correct archive for your system, verifies it against the published SHA-256 manifest, and installs `ronin` to `~/.local/bin`. Override the destination with `RONIN_INSTALL_DIR`.
 
+Windows 10 or newer (64-bit), from PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/Binary-Brawlers/ronin-cli/main/install.ps1 | iex
+```
+
+The Windows installer verifies the release checksum, installs `ronin.exe` to `%LOCALAPPDATA%\Ronin\bin`, and adds that directory to your user `PATH`. Override the destination with `RONIN_INSTALL_DIR`.
+
 ## Sign in and start
 
 ```sh
@@ -23,10 +31,12 @@ Ronin opens the WorkOS device sign-in flow and connects to `https://chat-api.ron
 
 ## Releases
 
-Release archives and `SHA256SUMS` are available on the [Releases page](https://github.com/Binary-Brawlers/ronin-cli/releases). Set `RONIN_VERSION=ronin-v0.1.0` when running the installer to pin a specific release.
+Release archives and `SHA256SUMS` are available on the [Releases page](https://github.com/Binary-Brawlers/ronin-cli/releases). Set `RONIN_VERSION=ronin-v0.2.1` when running the installer to pin a specific release.
 
 ## Uninstall
 
 ```sh
 rm ~/.local/bin/ronin
 ```
+
+On Windows, remove `%LOCALAPPDATA%\Ronin\bin\ronin.exe` and remove its directory from your user `PATH`.
