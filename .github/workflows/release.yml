@@ -25,7 +25,7 @@ jobs:
             os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: houseabsolute/actions-rust-cross@v1
         with:
           toolchain: "1.88.0"
