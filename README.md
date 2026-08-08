@@ -120,7 +120,7 @@ After confirmation, the script:
 6. Waits for macOS, Linux, and Windows artifacts plus `SHA256SUMS`.
 7. Prints the published GitHub Release URL.
 
-Use `./scripts/release.sh --yes 0.2.3` only for an intentional non-interactive release. If an interruption happens after the tag is pushed, run the same command again to resume release verification.
+Use `./scripts/release.sh --yes 0.2.3` only for an intentional non-interactive release. If the command is interrupted, run it again with the same version; it resumes an existing release PR, tag, workflow, or published release instead of starting over.
 
 ## Uninstall
 
