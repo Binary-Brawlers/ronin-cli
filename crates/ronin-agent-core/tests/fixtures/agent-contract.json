@@ -1,0 +1,20 @@
+{
+  "messages": [
+    { "role": "system", "content": "system" },
+    { "role": "user", "content": "user" },
+    { "role": "assistant", "content": "", "toolCalls": [{ "id": "call-1", "name": "read_file", "arguments": "{\"path\":\"README.md\"}" }] },
+    { "role": "tool", "toolCallId": "call-1", "content": "result" }
+  ],
+  "events": [
+    { "type": "delta", "text": "hello" },
+    { "type": "reasoning", "text": "thinking" },
+    { "type": "tool_call", "toolCallId": "call-1", "toolName": "read_file", "args": "{}" },
+    { "type": "tool_result", "toolCallId": "call-1", "toolName": "read_file", "result": "ok", "isError": false },
+    { "type": "citation", "url": "https://example.com/source", "title": "Example source", "content": "Relevant excerpt" },
+    { "type": "done", "usage": { "inputTokens": 12, "outputTokens": 4, "cachedTokens": 3, "cacheWriteTokens": 1 }, "costMicro": 42, "finishReason": "tool_calls" },
+    { "type": "error", "code": "provider_error", "message": "failed", "retryable": true }
+  ],
+  "model": { "modelId": "provider/model", "displayName": "Model", "category": "coding", "supportsTools": true, "contextWindow": 128000, "creditPriceMicro": 100 },
+  "balance": { "available": 2000000, "reserved": 100000, "display": "20 credits" },
+  "error": { "code": "cli_upgrade_required", "message": "Please upgrade" }
+}
