@@ -6,8 +6,8 @@ use ronin_runtime::{
     permissions::PermissionController,
     run::{run_prompt, RunEvent, RunOutcome, RunRequest},
     storage::{
-        load_credentials_for, save_credentials, Credentials, LocalSession, SessionState,
-        SessionStore,
+        load_credentials_for, save_credentials, Credentials, LocalSession, SessionScanEntry,
+        SessionState, SessionStore,
     },
     terminal::TerminalPermissionAuthorizer,
     tui,
@@ -45,7 +45,7 @@ struct Cli {
     output_format: String,
     #[arg(long = "continue")]
     continue_session: bool,
-    #[arg(long)]
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
     resume: Option<String>,
     #[command(subcommand)]
     command: Option<Commands>,
@@ -64,12 +64,72 @@ enum Commands {
         all: bool,
         #[arg(long)]
         json: bool,
+        #[command(subcommand)]
+        command: Option<SessionCommands>,
+    },
+    Permissions {
+        #[command(subcommand)]
+        command: PermissionCommands,
     },
     Login {
         #[arg(long)]
         dev_user: Option<String>,
     },
     Logout,
+}
+
+#[derive(Subcommand)]
+enum SessionCommands {
+    Rename {
+        id: String,
+        title: String,
+    },
+    Fork {
+        id: String,
+    },
+    Archive {
+        id: String,
+    },
+    Unarchive {
+        id: String,
+    },
+    Delete {
+        id: String,
+    },
+    Restore {
+        id: String,
+    },
+    Trash {
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    EmptyTrash {
+        #[arg(long)]
+        yes: bool,
+    },
+    Doctor {
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum PermissionCommands {
+    List {
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    Revoke {
+        id: String,
+    },
+    Reset {
+        #[arg(long)]
+        workspace: bool,
+    },
 }
 
 #[tokio::main]
@@ -219,8 +279,12 @@ async fn run() -> Result<(), String> {
             }
             return Ok(());
         }
-        Some(Commands::Sessions { all, json }) => {
+        Some(Commands::Sessions { all, json, command }) => {
             let store = SessionStore::new(&home);
+            if let Some(command) = command {
+                handle_session_command(&store, &cwd, command)?;
+                return Ok(());
+            }
             let list = store.list((!all).then_some(cwd.as_path()));
             if json {
                 let summaries=list.iter().map(|s|serde_json::json!({"id":s.id,"workspace":s.cwd,"model":s.model,"state":s.state,"updatedAt":s.updated_at,"rounds":s.rounds,"compactionCount":s.compaction_count,"costCredits":s.cost_micro as f64/1_000_000.0})).collect::<Vec<_>>();
@@ -238,15 +302,72 @@ async fn run() -> Result<(), String> {
                     return Ok(());
                 }
                 for s in list {
-                    println!("{}  {:<11} {}", s.id, state_name(&s.state), s.model);
                     println!(
-                        "  {} · {} rounds · {} compactions · {:.4} credits",
+                        "{}  {:<11} {}",
+                        s.id,
+                        state_name(&s.state),
+                        s.title.as_deref().unwrap_or("Untitled session")
+                    );
+                    println!(
+                        "  {} · {} · {} rounds · {} compactions · {:.4} credits",
                         s.updated_at,
+                        s.model,
                         s.rounds,
                         s.compaction_count,
                         s.cost_micro as f64 / 1_000_000.0
                     );
                     println!("  {}", s.cwd);
+                }
+            }
+            return Ok(());
+        }
+        Some(Commands::Permissions { command }) => {
+            let policy = PermissionController::new(
+                &cwd,
+                &home,
+                config.clone(),
+                false,
+                io::stdin().is_terminal() && io::stderr().is_terminal(),
+            )?;
+            match command {
+                PermissionCommands::List { all, json } => {
+                    let cwd = fs_canonical_string(&cwd)?;
+                    let grants = policy
+                        .grants()
+                        .into_iter()
+                        .filter(|grant| all || grant.workspace_path == cwd)
+                        .collect::<Vec<_>>();
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string(&grants).map_err(|error| error.to_string())?
+                        );
+                    } else if grants.is_empty() {
+                        println!(
+                            "No stored permission grants{}.",
+                            if all { "" } else { " for this workspace" }
+                        );
+                    } else {
+                        for grant in grants {
+                            println!("{}  {:<7} {}", grant.id, grant.kind, grant.value);
+                            println!("  {}", grant.workspace_path);
+                        }
+                    }
+                }
+                PermissionCommands::Revoke { id } => {
+                    if !policy.revoke_grant(&id)? {
+                        return Err(format!("Permission grant {id} was not found."));
+                    }
+                    println!("Revoked permission grant {id}.");
+                }
+                PermissionCommands::Reset { workspace } => {
+                    if !workspace {
+                        return Err(
+                            "Pass --workspace to reset grants for the current workspace.".into(),
+                        );
+                    }
+                    let removed = policy.reset_workspace()?;
+                    println!("Removed {removed} permission grant(s) for this workspace.");
                 }
             }
             return Ok(());
@@ -461,6 +582,8 @@ fn print_outcome(outcome: &RunOutcome, json: bool, streamed: bool) {
                 "usage": outcome.result.last_usage,
                 "contextPercent": outcome.result.context_percent,
                 "sources": outcome.result.sources,
+                "changedFiles": outcome.affected_paths,
+                "commands": outcome.commands,
             })
         );
         return;
@@ -483,6 +606,16 @@ fn print_outcome(outcome: &RunOutcome, json: bool, streamed: bool) {
     }
     for warning in &outcome.warnings {
         eprintln!("Warning: {}", warning.message);
+    }
+    if !outcome.affected_paths.is_empty() {
+        eprintln!("Native file changes: {}", outcome.affected_paths.join(", "));
+    }
+    if !outcome.commands.is_empty() {
+        eprintln!(
+            "Executed {} command{}.",
+            outcome.commands.len(),
+            if outcome.commands.len() == 1 { "" } else { "s" }
+        );
     }
     eprintln!(
         "\n{} round(s) · {:.4} credits{} · {}",
@@ -516,7 +649,12 @@ fn resolve_session(
     resume: Option<&str>,
 ) -> Result<Option<LocalSession>, String> {
     let session = if let Some(id) = resume {
-        Some(store.load(id).map_err(|e| e.to_string())?)
+        let id = if id.is_empty() {
+            pick_session(store, cwd)?
+        } else {
+            id.to_string()
+        };
+        Some(store.load(&id).map_err(|e| e.to_string())?)
     } else if cont {
         store.latest(cwd)
     } else {
@@ -548,6 +686,159 @@ fn resolve_session(
     }
     Ok(session)
 }
+
+fn pick_session(store: &SessionStore, cwd: &Path) -> Result<String, String> {
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        return Err("--resume without a session ID requires an interactive terminal.".into());
+    }
+    let sessions = store.list(Some(cwd));
+    if sessions.is_empty() {
+        return Err("No local session exists for this workspace.".into());
+    }
+    eprintln!("Select a session to resume:");
+    for (index, session) in sessions.iter().enumerate() {
+        eprintln!(
+            "  {}) {} · {} · {}",
+            index + 1,
+            session.title.as_deref().unwrap_or("Untitled session"),
+            session.model,
+            session.updated_at
+        );
+        eprintln!("     {}", session.id);
+    }
+    eprint!("Session [1-{}]: ", sessions.len());
+    io::stderr().flush().map_err(|error| error.to_string())?;
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .map_err(|error| error.to_string())?;
+    let index = answer
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|value| (1..=sessions.len()).contains(value))
+        .ok_or("Session selection cancelled or invalid.")?;
+    Ok(sessions[index - 1].id.clone())
+}
+
+fn handle_session_command(
+    store: &SessionStore,
+    cwd: &Path,
+    command: SessionCommands,
+) -> Result<(), String> {
+    match command {
+        SessionCommands::Rename { id, title } => {
+            let session = store
+                .rename(&id, &title)
+                .map_err(|error| error.to_string())?;
+            println!(
+                "Renamed session {} to {}.",
+                session.id,
+                session.title.as_deref().unwrap_or("Untitled session")
+            );
+        }
+        SessionCommands::Fork { id } => {
+            let session = store.fork(&id).map_err(|error| error.to_string())?;
+            println!("Forked session {id} as {}.", session.id);
+        }
+        SessionCommands::Archive { id } => {
+            store
+                .set_archived(&id, true)
+                .map_err(|error| error.to_string())?;
+            println!("Archived session {id}.");
+        }
+        SessionCommands::Unarchive { id } => {
+            store
+                .set_archived(&id, false)
+                .map_err(|error| error.to_string())?;
+            println!("Unarchived session {id}.");
+        }
+        SessionCommands::Delete { id } => {
+            store.trash(&id).map_err(|error| error.to_string())?;
+            println!("Moved session {id} to trash. It can be restored.");
+        }
+        SessionCommands::Restore { id } => {
+            store.restore(&id).map_err(|error| error.to_string())?;
+            println!("Restored session {id}.");
+        }
+        SessionCommands::Trash { all, json } => {
+            let sessions = store.list_trash((!all).then_some(cwd));
+            if json {
+                let summaries = sessions.iter().map(session_json).collect::<Vec<_>>();
+                println!(
+                    "{}",
+                    serde_json::to_string(&summaries).map_err(|error| error.to_string())?
+                );
+            } else if sessions.is_empty() {
+                println!(
+                    "Session trash is empty{}.",
+                    if all { "" } else { " for this workspace" }
+                );
+            } else {
+                for session in sessions {
+                    println!(
+                        "{}  {}  {}",
+                        session.id,
+                        session.title.as_deref().unwrap_or("Untitled session"),
+                        session.updated_at
+                    );
+                    println!("  {}", session.cwd);
+                }
+            }
+        }
+        SessionCommands::EmptyTrash { yes } => {
+            if !yes {
+                return Err("Emptying session trash is permanent. Pass --yes to continue.".into());
+            }
+            let removed = store.empty_trash().map_err(|error| error.to_string())?;
+            println!("Permanently removed {removed} session(s) from trash.");
+        }
+        SessionCommands::Doctor { all } => {
+            let entries = store.scan((!all).then_some(cwd));
+            let mut healthy = 0;
+            let mut failed = 0;
+            for entry in entries {
+                match entry {
+                    SessionScanEntry::Session(_) => healthy += 1,
+                    SessionScanEntry::Unsupported { id, version } => {
+                        failed += 1;
+                        println!("Unsupported: {id} uses schema version {version}.");
+                    }
+                    SessionScanEntry::Quarantined { id, reason, path } => {
+                        failed += 1;
+                        println!("Quarantined: {id}: {reason}");
+                        println!("  {path}");
+                    }
+                }
+            }
+            println!("Session store: {healthy} healthy, {failed} problem(s).");
+            if failed > 0 {
+                return Err("Session doctor found one or more problems.".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn session_json(session: &LocalSession) -> serde_json::Value {
+    serde_json::json!({
+        "id": session.id,
+        "title": session.title,
+        "workspace": session.cwd,
+        "model": session.model,
+        "state": session.state,
+        "updatedAt": session.updated_at,
+        "rounds": session.rounds,
+        "compactionCount": session.compaction_count,
+        "costCredits": session.cost_micro as f64 / 1_000_000.0,
+    })
+}
+
+fn fs_canonical_string(path: &Path) -> Result<String, String> {
+    std::fs::canonicalize(path)
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|error| error.to_string())
+}
 fn home() -> PathBuf {
     env::var_os("HOME")
         .map(Into::into)
@@ -563,7 +854,8 @@ fn state_name(state: &SessionState) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::accepts_update;
+    use super::{accepts_update, Cli, Commands, PermissionCommands, SessionCommands};
+    use clap::Parser;
 
     #[test]
     fn startup_update_prompt_requires_explicit_confirmation() {
@@ -572,5 +864,33 @@ mod tests {
         assert!(!accepts_update(""));
         assert!(!accepts_update("n"));
         assert!(!accepts_update("later"));
+    }
+
+    #[test]
+    fn resume_accepts_an_optional_session_id() {
+        let picker = Cli::try_parse_from(["ronin", "--resume"]).unwrap();
+        assert_eq!(picker.resume.as_deref(), Some(""));
+        let explicit = Cli::try_parse_from(["ronin", "--resume", "session-1"]).unwrap();
+        assert_eq!(explicit.resume.as_deref(), Some("session-1"));
+    }
+
+    #[test]
+    fn workflow_management_subcommands_parse() {
+        let session = Cli::try_parse_from(["ronin", "sessions", "fork", "session-1"]).unwrap();
+        assert!(matches!(
+            session.command,
+            Some(Commands::Sessions {
+                command: Some(SessionCommands::Fork { .. }),
+                ..
+            })
+        ));
+        let permissions =
+            Cli::try_parse_from(["ronin", "permissions", "reset", "--workspace"]).unwrap();
+        assert!(matches!(
+            permissions.command,
+            Some(Commands::Permissions {
+                command: PermissionCommands::Reset { workspace: true }
+            })
+        ));
     }
 }

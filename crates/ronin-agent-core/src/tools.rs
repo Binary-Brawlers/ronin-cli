@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 const MAX_RESULT_CHARS: usize = 30_000;
 const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
+const MAX_UNDO_BYTES: usize = 2 * 1024 * 1024;
 const SHELL_WARNING: &str = "Warning: the shell is shallowly contained. Commands start inside the workspace but can access paths outside it.";
 
 #[derive(Clone)]
@@ -393,18 +394,22 @@ impl Mutation {
             MutationKind::MultiEdit => "multi_edit",
         }
     }
-    fn plan(&self, args: &Value) -> Result<(PathBuf, String, String, String), String> {
+    fn plan(
+        &self,
+        args: &Value,
+    ) -> Result<(PathBuf, String, Option<String>, String, String), String> {
         let path = string(args, "path")?;
         let (abs, rel) = self.policy.resolve_write(path)?;
         let before = if abs.exists() {
-            fs::read_to_string(&abs).map_err(|e| e.to_string())?
+            Some(fs::read_to_string(&abs).map_err(|e| e.to_string())?)
         } else {
-            String::new()
+            None
         };
+        let before_text = before.as_deref().unwrap_or_default();
         let after = match self.kind {
             MutationKind::Write => string(args, "content")?.to_string(),
             MutationKind::Edit => replace_once(
-                &before,
+                before_text,
                 string(args, "old_string")?,
                 string(args, "new_string")?,
             )?,
@@ -416,7 +421,7 @@ impl Mutation {
                 if edits.is_empty() || edits.len() > 100 {
                     return Err("edits must contain between 1 and 100 replacements.".into());
                 }
-                let mut value = before.clone();
+                let mut value = before_text.to_string();
                 for (index, e) in edits.iter().enumerate() {
                     value = replace_once(&value, string(e, "old_string")?, string(e, "new_string")?)
                         .map_err(|x| format!("Edit {}: {x}", index + 1))?
@@ -429,11 +434,11 @@ impl Mutation {
                 "Refusing to write content containing a detected {s}."
             ));
         }
-        let diff = TextDiff::from_lines(&before, &after)
+        let diff = TextDiff::from_lines(before_text, &after)
             .unified_diff()
             .header(&format!("a/{rel}"), &format!("b/{rel}"))
             .to_string();
-        Ok((abs, rel, after, diff))
+        Ok((abs, rel, before, after, diff))
     }
 }
 #[async_trait]
@@ -459,7 +464,7 @@ impl AgentTool for Mutation {
         &self,
         args: &Value,
     ) -> Result<Option<ToolPermissionDescription>, String> {
-        let (_, rel, _, preview) = self.plan(args)?;
+        let (_, rel, _, _, preview) = self.plan(args)?;
         Ok(Some(ToolPermissionDescription {
             summary: format!("{} will modify {rel}", self.name()),
             preview: Some(preview),
@@ -468,8 +473,8 @@ impl AgentTool for Mutation {
         }))
     }
     async fn execute(&self, args: &Value, _: &CancellationToken) -> ToolResult {
-        let run = || -> Result<(String, String), String> {
-            let (abs, rel, after, _) = self.plan(args)?;
+        let run = || -> Result<(String, String, Option<String>, String), String> {
+            let (abs, rel, before, after, _) = self.plan(args)?;
             let prior_permissions = fs::metadata(&abs).ok().map(|meta| meta.permissions());
             if let Some(parent) = abs.parent() {
                 fs::create_dir_all(parent).map_err(|e| e.to_string())?
@@ -483,20 +488,94 @@ impl AgentTool for Mutation {
                     .map_err(|e| e.to_string())?;
             }
             tmp.persist(&abs).map_err(|e| e.to_string())?;
-            Ok((format!("{} updated {rel}.", self.name()), rel))
+            Ok((
+                format!("{} updated {rel}.", self.name()),
+                rel,
+                before,
+                after,
+            ))
         };
         match run() {
-            Ok((message, path)) => ToolResult {
-                result: message,
-                is_error: false,
-                metadata: crate::ToolResultMetadata {
-                    affected_paths: vec![path],
-                    ..Default::default()
-                },
-            },
+            Ok((message, path, before, after)) => {
+                let undo_bytes = before.as_ref().map_or(0, String::len) + after.len();
+                let file_changes = (undo_bytes <= MAX_UNDO_BYTES)
+                    .then(|| crate::FileChange {
+                        path: path.clone(),
+                        before,
+                        after,
+                    })
+                    .into_iter()
+                    .collect();
+                ToolResult {
+                    result: message,
+                    is_error: false,
+                    metadata: crate::ToolResultMetadata {
+                        affected_paths: vec![path],
+                        file_changes,
+                        ..Default::default()
+                    },
+                }
+            }
             Err(error) => ToolResult::error(error),
         }
     }
+}
+
+pub fn diff_file_changes(changes: &[crate::FileChange]) -> String {
+    changes
+        .iter()
+        .map(|change| {
+            TextDiff::from_lines(change.before.as_deref().unwrap_or_default(), &change.after)
+                .unified_diff()
+                .header(&format!("a/{}", change.path), &format!("b/{}", change.path))
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub fn undo_file_changes(
+    cwd: impl AsRef<Path>,
+    changes: &[crate::FileChange],
+) -> Result<Vec<String>, String> {
+    let policy = WorkspacePolicy::new(cwd)?;
+    let mut plans = Vec::with_capacity(changes.len());
+    for change in changes.iter().rev() {
+        let (path, relative) = policy.resolve_write(&change.path)?;
+        let current = fs::read_to_string(&path).map_err(|error| {
+            format!("Cannot undo {relative}: current file could not be read: {error}")
+        })?;
+        if current != change.after {
+            return Err(format!(
+                "Cannot undo {relative} because it changed after Ronin's edit."
+            ));
+        }
+        plans.push((path, relative, change.before.clone()));
+    }
+    let mut restored = Vec::with_capacity(plans.len());
+    for (path, relative, before) in plans {
+        match before {
+            Some(content) => {
+                let permissions = fs::metadata(&path).ok().map(|meta| meta.permissions());
+                let mut temp = tempfile::NamedTempFile::new_in(
+                    path.parent()
+                        .ok_or("Undo target has no parent directory.")?,
+                )
+                .map_err(|error| error.to_string())?;
+                temp.write_all(content.as_bytes())
+                    .map_err(|error| error.to_string())?;
+                if let Some(permissions) = permissions {
+                    temp.as_file()
+                        .set_permissions(permissions)
+                        .map_err(|error| error.to_string())?;
+                }
+                temp.persist(&path).map_err(|error| error.to_string())?;
+            }
+            None => fs::remove_file(&path).map_err(|error| error.to_string())?,
+        }
+        restored.push(relative);
+    }
+    Ok(restored)
 }
 
 struct Bash(Arc<WorkspacePolicy>);
@@ -612,6 +691,7 @@ impl AgentTool for Bash {
                 exit_code: status.code(),
                 truncated: output_truncated,
                 affected_paths: vec![],
+                file_changes: vec![],
                 stdout: Some(out.chars().take(24_000).collect()),
                 stderr: Some(err.chars().take(24_000).collect()),
             },

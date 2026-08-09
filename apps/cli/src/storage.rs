@@ -1,7 +1,9 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
-use ronin_agent_core::{AgentMessage, AgentSessionMetadata, AgentStopReason, TokenUsage};
+use ronin_agent_core::{
+    AgentMessage, AgentSessionMetadata, AgentStopReason, FileChange, TokenUsage,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -159,6 +161,12 @@ pub struct LocalSession {
     pub pending_turn_base: Option<usize>,
     #[serde(default)]
     pub activity: Vec<SessionActivity>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub last_turn_changes: Vec<FileChange>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub last_turn_affected_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub last_turn_commands: Vec<String>,
 }
 
 fn default_permission_mode() -> String {
@@ -326,6 +334,9 @@ impl SessionStore {
             permission_mode: default_permission_mode(),
             pending_turn_base: None,
             activity: vec![],
+            last_turn_changes: vec![],
+            last_turn_affected_paths: vec![],
+            last_turn_commands: vec![],
         };
         self.save(&session)
     }
@@ -442,6 +453,9 @@ impl SessionStore {
         fork.compaction_count = 0;
         fork.pending_turn_base = None;
         fork.activity.clear();
+        fork.last_turn_changes.clear();
+        fork.last_turn_affected_paths.clear();
+        fork.last_turn_commands.clear();
         fork.permission_mode = default_permission_mode();
         self.save(&fork)
     }
