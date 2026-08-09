@@ -25,8 +25,19 @@ pub struct ToolResultMetadata {
     pub exit_code: Option<i32>,
     pub truncated: bool,
     pub affected_paths: Vec<String>,
+    #[serde(default)]
+    pub file_changes: Vec<FileChange>,
     pub stdout: Option<String>,
     pub stderr: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FileChange {
+    pub path: String,
+    /// `None` means the file was created by the tool call.
+    pub before: Option<String>,
+    pub after: String,
 }
 impl ToolResult {
     pub fn ok(value: impl Into<String>) -> Self {

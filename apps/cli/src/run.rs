@@ -9,6 +9,7 @@ use futures::StreamExt;
 use ronin_agent_core::*;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -53,6 +54,9 @@ pub struct RunOutcome {
     pub result: AgentLoopResult,
     pub invocation_cost_micro: u64,
     pub warnings: Vec<RunWarning>,
+    pub file_changes: Vec<FileChange>,
+    pub affected_paths: Vec<String>,
+    pub commands: Vec<String>,
 }
 
 fn publish(tx: &Option<mpsc::UnboundedSender<RunEvent>>, event: RunEvent) {
@@ -223,8 +227,13 @@ pub async fn run_prompt(
     };
     let session_cell = Arc::new(Mutex::new(session.clone()));
     let activity_cell = Arc::new(Mutex::new(session.activity.clone()));
+    let change_cell = Arc::new(Mutex::new(Vec::<FileChange>::new()));
+    let affected_path_cell = Arc::new(Mutex::new(Vec::<String>::new()));
+    let command_cell = Arc::new(Mutex::new(Vec::<String>::new()));
     let checkpoint_cell = session_cell.clone();
     let checkpoint_activity = activity_cell.clone();
+    let checkpoint_affected_paths = affected_path_cell.clone();
+    let checkpoint_commands = command_cell.clone();
     let checkpoint_store = store.clone();
     let checkpoint_tx = request.event_tx.clone();
     let base_cost = session.cost_micro;
@@ -244,6 +253,14 @@ pub async fn run_prompt(
             .lock()
             .expect("session activity lock poisoned")
             .clone();
+        current.last_turn_affected_paths = checkpoint_affected_paths
+            .lock()
+            .expect("turn affected-path lock poisoned")
+            .clone();
+        current.last_turn_commands = checkpoint_commands
+            .lock()
+            .expect("turn command lock poisoned")
+            .clone();
         current.state = if current.stop_reason.is_some() {
             SessionState::Completed
         } else {
@@ -256,7 +273,56 @@ pub async fn run_prompt(
     });
     let agent_tx = request.event_tx.clone();
     let event_activity = activity_cell.clone();
+    let event_changes = change_cell.clone();
+    let event_affected_paths = affected_path_cell.clone();
+    let event_commands = command_cell.clone();
+    let pending_commands = Arc::new(Mutex::new(HashMap::<String, String>::new()));
     let on_event = Arc::new(move |event: AgentLoopEvent| {
+        if let AgentLoopEvent::ToolStart(name, arguments, call_id) = &event {
+            if name == "bash" {
+                if let Some(command) = serde_json::from_str::<serde_json::Value>(arguments)
+                    .ok()
+                    .and_then(|value| value.get("command")?.as_str().map(str::to_owned))
+                {
+                    pending_commands
+                        .lock()
+                        .expect("pending command lock poisoned")
+                        .insert(call_id.clone(), command);
+                }
+            }
+        }
+        if let AgentLoopEvent::ToolEnd(_, _, is_error, call_id, _, metadata) = &event {
+            let command = pending_commands
+                .lock()
+                .expect("pending command lock poisoned")
+                .remove(call_id);
+            if !is_error {
+                if let Some(command) = command {
+                    event_commands
+                        .lock()
+                        .expect("turn command lock poisoned")
+                        .push(command);
+                }
+                let mut affected = event_affected_paths
+                    .lock()
+                    .expect("turn affected-path lock poisoned");
+                for path in &metadata.affected_paths {
+                    if !affected.contains(path) {
+                        affected.push(path.clone());
+                    }
+                }
+                drop(affected);
+                let mut changes = event_changes.lock().expect("turn change lock poisoned");
+                for change in &metadata.file_changes {
+                    if let Some(existing) = changes.iter_mut().find(|item| item.path == change.path)
+                    {
+                        existing.after = change.after.clone();
+                    } else {
+                        changes.push(change.clone());
+                    }
+                }
+            }
+        }
         let entry = match &event {
             AgentLoopEvent::ToolEnd(name, output, is_error, call_id, _, _metadata) => {
                 Some(crate::storage::SessionActivity {
@@ -332,6 +398,21 @@ pub async fn run_prompt(
     session.stop_reason = Some(result.stop_reason.clone());
     session.state = SessionState::Completed;
     session.pending_turn_base = None;
+    let file_changes = change_cell
+        .lock()
+        .expect("turn change lock poisoned")
+        .clone();
+    let affected_paths = affected_path_cell
+        .lock()
+        .expect("turn affected-path lock poisoned")
+        .clone();
+    let commands = command_cell
+        .lock()
+        .expect("turn command lock poisoned")
+        .clone();
+    session.last_turn_changes = file_changes.clone();
+    session.last_turn_affected_paths = affected_paths.clone();
+    session.last_turn_commands = commands.clone();
     session = store.save(&session).map_err(|error| error.to_string())?;
     let sync_result = tokio::time::timeout(
         std::time::Duration::from_secs(3),
@@ -359,6 +440,9 @@ pub async fn run_prompt(
         result,
         invocation_cost_micro,
         warnings,
+        file_changes,
+        affected_paths,
+        commands,
     })
 }
 

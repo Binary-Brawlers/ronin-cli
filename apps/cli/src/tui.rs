@@ -25,9 +25,9 @@ use ratatui::{
     Frame, Terminal, TerminalOptions, Viewport,
 };
 use ronin_agent_core::{
-    create_mutation_tools, AgentLoopEvent, AgentStopReason, AgentTool, ModelSummary,
-    PermissionAuthorizer, SourceCitation, ToolPermissionDescription, UserAnswer, UserQuestion,
-    UserQuestioner,
+    create_mutation_tools, diff_file_changes, undo_file_changes, AgentLoopEvent, AgentStopReason,
+    AgentTool, ModelSummary, PermissionAuthorizer, SourceCitation, ToolPermissionDescription,
+    UserAnswer, UserQuestion, UserQuestioner,
 };
 use serde_json::Value;
 use std::{
@@ -373,9 +373,70 @@ async fn tui_main(
                     s.messages.clear();
                     s.context_percent = None;
                     s.last_usage = None;
+                    s.last_turn_changes.clear();
+                    s.last_turn_affected_paths.clear();
+                    s.last_turn_commands.clear();
                     *s = store.save(s).map_err(err)?;
                 }
                 note(term, "Conversation history cleared.", DIM)?;
+                continue;
+            }
+            "/diff" => {
+                match session.as_ref() {
+                    Some(current) if !current.last_turn_changes.is_empty() => {
+                        commit_change_diff(term, &diff_file_changes(&current.last_turn_changes))?;
+                    }
+                    Some(current) if !current.last_turn_affected_paths.is_empty() => note(
+                        term,
+                        "A detailed diff was not retained for the latest native edit.",
+                        YELLOW,
+                    )?,
+                    _ => note(term, "No native file changes to show.", DIM)?,
+                }
+                continue;
+            }
+            "/undo" => {
+                let Some(current) = session.as_mut() else {
+                    note(term, "No native file changes to undo.", DIM)?;
+                    continue;
+                };
+                if current.last_turn_changes.is_empty() {
+                    note(
+                        term,
+                        if current.last_turn_affected_paths.is_empty() {
+                            "No native file changes to undo."
+                        } else {
+                            "The latest native edit is not undoable because its before-image was not retained."
+                        },
+                        YELLOW,
+                    )?;
+                    continue;
+                }
+                match undo_file_changes(cwd, &current.last_turn_changes) {
+                    Ok(paths) => {
+                        current.last_turn_changes.clear();
+                        current.last_turn_affected_paths.clear();
+                        current.last_turn_commands.clear();
+                        *current = store.save(current).map_err(err)?;
+                        note(
+                            term,
+                            &format!("Undid the latest turn's changes to {}.", paths.join(", ")),
+                            GREEN,
+                        )?;
+                    }
+                    Err(error) => {
+                        if !error.restored_paths.is_empty() {
+                            current
+                                .last_turn_changes
+                                .retain(|change| !error.restored_paths.contains(&change.path));
+                            current
+                                .last_turn_affected_paths
+                                .retain(|path| !error.restored_paths.contains(path));
+                            *current = store.save(current).map_err(err)?;
+                        }
+                        note(term, &error.to_string(), RED)?;
+                    }
+                }
                 continue;
             }
             "/compact" => {
@@ -694,13 +755,15 @@ fn banner(
 }
 
 fn commit_help(term: &mut Term) -> Result<(), String> {
-    let rows: [(&str, &str); 9] = [
+    let rows: [(&str, &str); 11] = [
         ("/help", "Show this help"),
         ("shift+tab", "Cycle Manual, Accept edits, Plan, and Auto"),
         ("/model [id]", "Pick a model (searchable) or set one by id"),
         ("/cost", "Show credits spent in this session"),
         ("/clear", "Clear the conversation history"),
         ("/compact", "Summarize the context to free space"),
+        ("/diff", "Show native file changes from the latest turn"),
+        ("/undo", "Undo native file changes from the latest turn"),
         (
             "/web on|off",
             "Enable or disable model-controlled web search",
@@ -714,6 +777,36 @@ fn commit_help(term: &mut Term) -> Result<(), String> {
             Span::styled(format!("  {cmd:<17}"), Style::default().fg(ACCENT)),
             Span::styled(help.to_string(), Style::default().fg(FG)),
         ]));
+    }
+    commit(term, lines)
+}
+
+fn commit_change_diff(term: &mut Term, diff: &str) -> Result<(), String> {
+    const MAX_DIFF_LINES: usize = 500;
+    let mut lines = vec![Line::default()];
+    let total = diff.lines().count();
+    for line in diff.lines().take(MAX_DIFF_LINES) {
+        let color = if line.starts_with("+++") || line.starts_with("---") {
+            ACCENT
+        } else if line.starts_with('+') {
+            GREEN
+        } else if line.starts_with('-') {
+            RED
+        } else if line.starts_with("@@") {
+            PURPLE
+        } else {
+            FG
+        };
+        lines.push(Line::from(Span::styled(
+            line.to_string(),
+            Style::default().fg(color),
+        )));
+    }
+    if total > MAX_DIFF_LINES {
+        lines.push(Line::from(Span::styled(
+            format!("… {} more diff line(s) omitted.", total - MAX_DIFF_LINES),
+            Style::default().fg(DIM),
+        )));
     }
     commit(term, lines)
 }
@@ -1906,9 +1999,37 @@ async fn run_turn(
         }
     };
     let code = outcome.code;
+    commit_turn_stats(term, &view, &outcome.session)?;
+    commit_turn_summary(term, &outcome.affected_paths, &outcome.commands)?;
     let session = outcome.session;
-    commit_turn_stats(term, &view, &session)?;
     Ok((code, session))
+}
+
+fn commit_turn_summary(
+    term: &mut Term,
+    affected_paths: &[String],
+    commands: &[String],
+) -> Result<(), String> {
+    if affected_paths.is_empty() && commands.is_empty() {
+        return Ok(());
+    }
+    let mut parts = Vec::new();
+    if !affected_paths.is_empty() {
+        parts.push(format!(
+            "{} native file edit{}: {}",
+            affected_paths.len(),
+            if affected_paths.len() == 1 { "" } else { "s" },
+            affected_paths.join(", ")
+        ));
+    }
+    if !commands.is_empty() {
+        parts.push(format!(
+            "{} command{} executed",
+            commands.len(),
+            if commands.len() == 1 { "" } else { "s" }
+        ));
+    }
+    note(term, &parts.join(" · "), DIM)
 }
 
 #[derive(Debug)]

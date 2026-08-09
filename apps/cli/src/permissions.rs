@@ -242,6 +242,21 @@ impl PermissionController {
         }
         Ok(removed)
     }
+
+    pub fn reset_workspace(&self) -> Result<usize, String> {
+        let mut store = self.store.lock().expect("permission store lock poisoned");
+        let removed = store
+            .workspaces
+            .remove(&self.key)
+            .map(|workspace| workspace.allowed_tools.len() + workspace.allowed_commands.len())
+            .unwrap_or(0);
+        if removed > 0 {
+            let snapshot = store.clone();
+            drop(store);
+            self.save(&snapshot)?;
+        }
+        Ok(removed)
+    }
 }
 
 fn grant(workspace_key: &str, path: &str, kind: &str, value: &str) -> StoredPermissionGrant {
