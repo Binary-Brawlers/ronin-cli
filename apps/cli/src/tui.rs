@@ -388,7 +388,7 @@ async fn tui_main(
                     }
                     Some(current) if !current.last_turn_affected_paths.is_empty() => note(
                         term,
-                        "The latest native edit was too large to retain a detailed diff.",
+                        "A detailed diff was not retained for the latest native edit.",
                         YELLOW,
                     )?,
                     _ => note(term, "No native file changes to show.", DIM)?,
@@ -406,7 +406,7 @@ async fn tui_main(
                         if current.last_turn_affected_paths.is_empty() {
                             "No native file changes to undo."
                         } else {
-                            "The latest native edit is not undoable because its contents were too large to retain."
+                            "The latest native edit is not undoable because its before-image was not retained."
                         },
                         YELLOW,
                     )?;
@@ -424,7 +424,18 @@ async fn tui_main(
                             GREEN,
                         )?;
                     }
-                    Err(error) => note(term, &error, RED)?,
+                    Err(error) => {
+                        if !error.restored_paths.is_empty() {
+                            current
+                                .last_turn_changes
+                                .retain(|change| !error.restored_paths.contains(&change.path));
+                            current
+                                .last_turn_affected_paths
+                                .retain(|path| !error.restored_paths.contains(path));
+                            *current = store.save(current).map_err(err)?;
+                        }
+                        note(term, &error.to_string(), RED)?;
+                    }
                 }
                 continue;
             }
@@ -771,8 +782,10 @@ fn commit_help(term: &mut Term) -> Result<(), String> {
 }
 
 fn commit_change_diff(term: &mut Term, diff: &str) -> Result<(), String> {
+    const MAX_DIFF_LINES: usize = 500;
     let mut lines = vec![Line::default()];
-    for line in diff.lines() {
+    let total = diff.lines().count();
+    for line in diff.lines().take(MAX_DIFF_LINES) {
         let color = if line.starts_with("+++") || line.starts_with("---") {
             ACCENT
         } else if line.starts_with('+') {
@@ -787,6 +800,12 @@ fn commit_change_diff(term: &mut Term, diff: &str) -> Result<(), String> {
         lines.push(Line::from(Span::styled(
             line.to_string(),
             Style::default().fg(color),
+        )));
+    }
+    if total > MAX_DIFF_LINES {
+        lines.push(Line::from(Span::styled(
+            format!("… {} more diff line(s) omitted.", total - MAX_DIFF_LINES),
+            Style::default().fg(DIM),
         )));
     }
     commit(term, lines)

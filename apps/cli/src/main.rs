@@ -287,8 +287,11 @@ async fn run() -> Result<(), String> {
             }
             let list = store.list((!all).then_some(cwd.as_path()));
             if json {
-                let summaries=list.iter().map(|s|serde_json::json!({"id":s.id,"workspace":s.cwd,"model":s.model,"state":s.state,"updatedAt":s.updated_at,"rounds":s.rounds,"compactionCount":s.compaction_count,"costCredits":s.cost_micro as f64/1_000_000.0})).collect::<Vec<_>>();
-                println!("{}", serde_json::to_string(&summaries).unwrap())
+                let summaries = list.iter().map(session_json).collect::<Vec<_>>();
+                println!(
+                    "{}",
+                    serde_json::to_string(&summaries).map_err(|error| error.to_string())?
+                )
             } else {
                 if list.is_empty() {
                     println!(
@@ -329,6 +332,9 @@ async fn run() -> Result<(), String> {
                 false,
                 io::stdin().is_terminal() && io::stderr().is_terminal(),
             )?;
+            for warning in policy.take_warnings() {
+                eprintln!("Warning: {warning}");
+            }
             match command {
                 PermissionCommands::List { all, json } => {
                     let cwd = fs_canonical_string(&cwd)?;
@@ -855,7 +861,7 @@ fn state_name(state: &SessionState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{accepts_update, Cli, Commands, PermissionCommands, SessionCommands};
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
     #[test]
     fn startup_update_prompt_requires_explicit_confirmation() {
@@ -872,6 +878,11 @@ mod tests {
         assert_eq!(picker.resume.as_deref(), Some(""));
         let explicit = Cli::try_parse_from(["ronin", "--resume", "session-1"]).unwrap();
         assert_eq!(explicit.resume.as_deref(), Some("session-1"));
+    }
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
     }
 
     #[test]

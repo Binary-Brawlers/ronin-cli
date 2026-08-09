@@ -42,7 +42,7 @@ ronin
 
 Run `ronin doctor` to check credentials, API connectivity, balance, and model availability. Run `ronin --help` for commands and flags.
 
-Resume the latest session with `ronin --continue`, choose a workspace session interactively with `ronin --resume`, or pass an exact ID with `ronin --resume <id>`. Session lifecycle operations are available under `ronin sessions`, including rename, fork, archive, delete, restore, trash, and doctor commands.
+Resume the latest session with `ronin --continue`, choose a workspace session interactively with `ronin --resume`, or pass an exact ID with `ronin --resume <id>`. Session lifecycle operations are available under `ronin sessions`, including rename, fork, archive, unarchive, delete, restore, trash, empty-trash, and doctor commands.
 
 Stored “always allow” decisions can be inspected and removed with `ronin permissions list`, `ronin permissions revoke <id>`, and `ronin permissions reset --workspace`. Inside the interactive interface, `/diff` shows native file edits from the latest turn and `/undo` restores them when the files have not changed again.
 

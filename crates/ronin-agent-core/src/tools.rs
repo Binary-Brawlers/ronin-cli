@@ -534,44 +534,78 @@ pub fn diff_file_changes(changes: &[crate::FileChange]) -> String {
         .join("\n")
 }
 
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{message}")]
+pub struct UndoFileChangesError {
+    pub message: String,
+    pub restored_paths: Vec<String>,
+}
+
+impl From<String> for UndoFileChangesError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            restored_paths: vec![],
+        }
+    }
+}
+
 pub fn undo_file_changes(
     cwd: impl AsRef<Path>,
     changes: &[crate::FileChange],
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, UndoFileChangesError> {
     let policy = WorkspacePolicy::new(cwd)?;
     let mut plans = Vec::with_capacity(changes.len());
     for change in changes.iter().rev() {
         let (path, relative) = policy.resolve_write(&change.path)?;
         let current = fs::read_to_string(&path).map_err(|error| {
-            format!("Cannot undo {relative}: current file could not be read: {error}")
+            UndoFileChangesError::from(format!(
+                "Cannot undo {relative}: current file could not be read: {error}"
+            ))
         })?;
         if current != change.after {
-            return Err(format!(
+            return Err(UndoFileChangesError::from(format!(
                 "Cannot undo {relative} because it changed after Ronin's edit."
-            ));
+            )));
         }
         plans.push((path, relative, change.before.clone()));
     }
     let mut restored = Vec::with_capacity(plans.len());
     for (path, relative, before) in plans {
-        match before {
-            Some(content) => {
-                let permissions = fs::metadata(&path).ok().map(|meta| meta.permissions());
-                let mut temp = tempfile::NamedTempFile::new_in(
-                    path.parent()
-                        .ok_or("Undo target has no parent directory.")?,
-                )
-                .map_err(|error| error.to_string())?;
-                temp.write_all(content.as_bytes())
+        let apply = || -> Result<(), String> {
+            match before {
+                Some(content) => {
+                    let permissions = fs::metadata(&path).ok().map(|meta| meta.permissions());
+                    let mut temp = tempfile::NamedTempFile::new_in(
+                        path.parent()
+                            .ok_or_else(|| "Undo target has no parent directory.".to_string())?,
+                    )
                     .map_err(|error| error.to_string())?;
-                if let Some(permissions) = permissions {
-                    temp.as_file()
-                        .set_permissions(permissions)
+                    temp.write_all(content.as_bytes())
                         .map_err(|error| error.to_string())?;
+                    if let Some(permissions) = permissions {
+                        temp.as_file()
+                            .set_permissions(permissions)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    temp.persist(&path).map_err(|error| error.to_string())?;
                 }
-                temp.persist(&path).map_err(|error| error.to_string())?;
+                None => fs::remove_file(&path).map_err(|error| error.to_string())?,
             }
-            None => fs::remove_file(&path).map_err(|error| error.to_string())?,
+            Ok(())
+        };
+        if let Err(error) = apply() {
+            let completed = if restored.is_empty() {
+                "none".to_string()
+            } else {
+                restored.join(", ")
+            };
+            return Err(UndoFileChangesError {
+                message: format!(
+                    "Undo stopped at {relative}: {error}. Already restored: {completed}."
+                ),
+                restored_paths: restored,
+            });
         }
         restored.push(relative);
     }

@@ -9,6 +9,7 @@ use futures::StreamExt;
 use ronin_agent_core::*;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -231,7 +232,6 @@ pub async fn run_prompt(
     let command_cell = Arc::new(Mutex::new(Vec::<String>::new()));
     let checkpoint_cell = session_cell.clone();
     let checkpoint_activity = activity_cell.clone();
-    let checkpoint_changes = change_cell.clone();
     let checkpoint_affected_paths = affected_path_cell.clone();
     let checkpoint_commands = command_cell.clone();
     let checkpoint_store = store.clone();
@@ -252,10 +252,6 @@ pub async fn run_prompt(
         current.activity = checkpoint_activity
             .lock()
             .expect("session activity lock poisoned")
-            .clone();
-        current.last_turn_changes = checkpoint_changes
-            .lock()
-            .expect("turn change lock poisoned")
             .clone();
         current.last_turn_affected_paths = checkpoint_affected_paths
             .lock()
@@ -280,22 +276,33 @@ pub async fn run_prompt(
     let event_changes = change_cell.clone();
     let event_affected_paths = affected_path_cell.clone();
     let event_commands = command_cell.clone();
+    let pending_commands = Arc::new(Mutex::new(HashMap::<String, String>::new()));
     let on_event = Arc::new(move |event: AgentLoopEvent| {
-        if let AgentLoopEvent::ToolStart(name, arguments, _) = &event {
+        if let AgentLoopEvent::ToolStart(name, arguments, call_id) = &event {
             if name == "bash" {
                 if let Some(command) = serde_json::from_str::<serde_json::Value>(arguments)
                     .ok()
                     .and_then(|value| value.get("command")?.as_str().map(str::to_owned))
                 {
+                    pending_commands
+                        .lock()
+                        .expect("pending command lock poisoned")
+                        .insert(call_id.clone(), command);
+                }
+            }
+        }
+        if let AgentLoopEvent::ToolEnd(_, _, is_error, call_id, _, metadata) = &event {
+            let command = pending_commands
+                .lock()
+                .expect("pending command lock poisoned")
+                .remove(call_id);
+            if !is_error {
+                if let Some(command) = command {
                     event_commands
                         .lock()
                         .expect("turn command lock poisoned")
                         .push(command);
                 }
-            }
-        }
-        if let AgentLoopEvent::ToolEnd(_, _, is_error, _, _, metadata) = &event {
-            if !is_error {
                 let mut affected = event_affected_paths
                     .lock()
                     .expect("turn affected-path lock poisoned");
