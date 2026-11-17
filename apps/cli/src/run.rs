@@ -86,6 +86,7 @@ pub async fn run_prompt(
     } else {
         config.permission_mode
     };
+    client.configure_harness(request.cwd, mode);
     let mut tools = create_read_only_tools(request.cwd)?;
     tools.push(create_ask_user_tool(
         request
@@ -122,6 +123,12 @@ pub async fn run_prompt(
             )
             .map_err(|error| error.to_string())?,
     };
+    let external_harness = crate::harness::HarnessRegistry::handles_model(&selected.model_id);
+    if external_harness {
+        // Native harnesses persist and resume their own sessions. A Ronin
+        // generation id is only attachable to the hosted SSE transport.
+        session.active_generation_id = None;
+    }
     let _run_lease = if request.source == "cli" {
         Some(store.acquire_lease(&session.id, "cli", env!("CARGO_PKG_VERSION"), false)
             .map_err(|_| "This session is owned by another Ronin client. Open it there or start a new session.".to_string())?)
@@ -146,7 +153,9 @@ pub async fn run_prompt(
         && used_tokens.map_or(multiple_turns, |tokens| {
             tokens as f64 / selected.context_window as f64 >= 0.8
         });
-    if session.context_percent.unwrap_or(0.0) >= 0.8 || switch_needs_compaction {
+    if !external_harness
+        && (session.context_percent.unwrap_or(0.0) >= 0.8 || switch_needs_compaction)
+    {
         let internal = config
             .internal_model
             .as_ref()
@@ -414,23 +423,25 @@ pub async fn run_prompt(
     session.last_turn_affected_paths = affected_paths.clone();
     session.last_turn_commands = commands.clone();
     session = store.save(&session).map_err(|error| error.to_string())?;
-    let sync_result = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        client.upsert_agent_session(&session.metadata_for(request.cwd, request.source)),
-    )
-    .await;
-    let sync_error = match sync_result {
-        Ok(Ok(_)) => None,
-        Ok(Err(error)) => Some(error.to_string()),
-        Err(_) => Some("request timed out".into()),
-    };
-    if let Some(message) = sync_error {
-        let warning = RunWarning {
-            code: "session_metadata_sync_failed".into(),
-            message,
+    if !external_harness {
+        let sync_result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client.upsert_agent_session(&session.metadata_for(request.cwd, request.source)),
+        )
+        .await;
+        let sync_error = match sync_result {
+            Ok(Ok(_)) => None,
+            Ok(Err(error)) => Some(error.to_string()),
+            Err(_) => Some("request timed out".into()),
         };
-        publish(&request.event_tx, RunEvent::Warning(warning.clone()));
-        warnings.push(warning);
+        if let Some(message) = sync_error {
+            let warning = RunWarning {
+                code: "session_metadata_sync_failed".into(),
+                message,
+            };
+            publish(&request.event_tx, RunEvent::Warning(warning.clone()));
+            warnings.push(warning);
+        }
     }
     let invocation_cost_micro = session.cost_micro.saturating_sub(invocation_start_cost);
     let code = i32::from(result.stop_reason != AgentStopReason::Complete);

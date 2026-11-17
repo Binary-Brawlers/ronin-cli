@@ -8,6 +8,7 @@ pub mod auth;
 pub mod client;
 pub mod config;
 pub mod context;
+pub mod harness;
 pub mod permissions;
 pub mod run;
 pub mod storage;

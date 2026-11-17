@@ -4,11 +4,12 @@
 [![Release](https://img.shields.io/github/v/release/Binary-Brawlers/ronin-cli?display_name=tag)](https://github.com/Binary-Brawlers/ronin-cli/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Ronin is an open-source, terminal-native coding agent powered by multiple AI models through your Ronin account. The CLI runs its agent loop, repository tools, permission policy, session storage, and terminal interface locally. Authentication, model access, and usage settlement are provided by the hosted Ronin service.
+Ronin is an open-source, terminal-native coding agent powered by multiple AI models. Use a Ronin account, or bring an existing Codex, Claude Code, or OpenCode-supported plan through its official local CLI. Ronin keeps its terminal interface and session index local; hosted Ronin usage is settled by Ronin, while local harness usage stays with that provider.
 
 ## Features
 
 - Multi-model coding through OpenRouter-backed Ronin accounts
+- Bring-your-own Codex and Claude Code subscriptions, plus OpenCode providers
 - Resumable, branching local conversations
 - Manual, accept-edits, plan, and auto permission modes
 - Native file, search, patch, shell, web-search, and user-question tools
@@ -41,6 +42,23 @@ ronin
 ```
 
 Run `ronin doctor` to check credentials, API connectivity, balance, and model availability. Run `ronin --help` for commands and flags.
+
+### Use an existing provider plan
+
+Ronin delegates local-provider turns to the provider's official installed harness. It does not read, copy, or proxy OAuth tokens. Authenticate with the provider, list the namespaced models, then select one:
+
+```sh
+ronin providers
+ronin providers setup codex      # or claude / opencode
+ronin models
+ronin --model codex/MODEL_ID
+ronin --model claude/sonnet
+ronin --model opencode/PROVIDER/MODEL_ID
+```
+
+The model namespaces are `codex/`, `claude/`, and `opencode/`. Native harnesses own their tool loop, provider session, context compaction, and billing. Ronin stores only the mapping between a Ronin session and the native session ID in `~/.ronin/harness-sessions.json`.
+
+This first command-adapter implementation uses the closest safe non-interactive equivalent for each Ronin permission mode. Manual denies provider actions that need an interactive approval, Plan is read-only, Auto requests the harness's automatic workspace permissions, and `--dangerously-skip-permissions` explicitly requests the provider's bypass mode. Exact capabilities can differ by harness; a future protocol bridge can surface per-tool native approval prompts inside Ronin.
 
 Resume the latest session with `ronin --continue`, choose a workspace session interactively with `ronin --resume`, or pass an exact ID with `ronin --resume <id>`. Session lifecycle operations are available under `ronin sessions`, including rename, fork, archive, unarchive, delete, restore, trash, empty-trash, and doctor commands.
 

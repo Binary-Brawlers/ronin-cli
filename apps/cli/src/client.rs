@@ -3,10 +3,12 @@ use futures::{stream, StreamExt};
 use reqwest::{Client, Response};
 use ronin_agent_core::*;
 use serde::{de::DeserializeOwned, Deserialize};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+use crate::{config::PermissionMode, harness::HarnessRegistry};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -76,6 +78,8 @@ pub struct RoninApiClient {
     http: Client,
     headers: Arc<dyn HeaderProvider>,
     identity: ClientIdentity,
+    harnesses: Option<Arc<HarnessRegistry>>,
+    hosted_enabled: bool,
 }
 #[async_trait]
 pub trait HeaderProvider: Send + Sync {
@@ -95,6 +99,21 @@ impl RoninApiClient {
             http: Client::new(),
             headers,
             identity,
+            harnesses: None,
+            hosted_enabled: true,
+        }
+    }
+    pub fn with_harnesses(mut self, harnesses: Arc<HarnessRegistry>) -> Self {
+        self.harnesses = Some(harnesses);
+        self
+    }
+    pub fn with_hosted_enabled(mut self, enabled: bool) -> Self {
+        self.hosted_enabled = enabled;
+        self
+    }
+    pub fn configure_harness(&self, cwd: &Path, permission_mode: PermissionMode) {
+        if let Some(harnesses) = &self.harnesses {
+            harnesses.configure(cwd, permission_mode);
         }
     }
     async fn apply(&self, b: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder, ApiError> {
@@ -133,8 +152,35 @@ impl RoninApiClient {
         }
     }
     pub async fn models(&self) -> Result<Vec<ModelSummary>, ApiError> {
-        self.json("/models", reqwest::Method::GET, None::<&()>)
-            .await
+        if !self.hosted_enabled {
+            let external = match &self.harnesses {
+                Some(harnesses) => harnesses.models().await,
+                None => vec![],
+            };
+            if external.is_empty() {
+                return Err(ApiError {
+                    status: 401,
+                    code: "credentials_missing".into(),
+                    message: "Log in to Ronin or authenticate a local provider.".into(),
+                });
+            }
+            return Ok(external);
+        }
+        let hosted: Result<Vec<ModelSummary>, ApiError> = self
+            .json("/models", reqwest::Method::GET, None::<&()>)
+            .await;
+        let external = match &self.harnesses {
+            Some(harnesses) => harnesses.models().await,
+            None => vec![],
+        };
+        match hosted {
+            Ok(mut models) => {
+                models.extend(external);
+                Ok(models)
+            }
+            Err(_) if !external.is_empty() => Ok(external),
+            Err(error) => Err(error),
+        }
     }
     pub async fn balance(&self) -> Result<BalanceSummary, ApiError> {
         self.json("/credits/balance", reqwest::Method::GET, None::<&()>)
@@ -299,6 +345,20 @@ impl CompletionClient for RoninApiClient {
         request: AgentCompletionRequest,
         cancel: &CancellationToken,
     ) -> Result<CompletionStream, AgentLoopError> {
+        if HarnessRegistry::handles_model(&request.model) {
+            return self
+                .harnesses
+                .as_ref()
+                .ok_or_else(|| {
+                    AgentLoopError::new(
+                        "harnesses_unavailable",
+                        "Native harness support is not configured",
+                        false,
+                    )
+                })?
+                .create_completion(request, cancel)
+                .await;
+        }
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Created {
@@ -318,6 +378,11 @@ impl CompletionClient for RoninApiClient {
         self.stream(id.into(), cancel).await
     }
     async fn stop_generation(&self, id: &str) -> Result<(), AgentLoopError> {
+        if let Some(harnesses) = &self.harnesses {
+            if harnesses.cancel_generation(id) {
+                return Ok(());
+            }
+        }
         let _: serde_json::Value = self
             .json(
                 &format!("/generations/{id}/stop"),

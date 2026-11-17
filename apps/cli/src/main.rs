@@ -3,6 +3,7 @@ use ronin_runtime::{
     auth::{begin_device_login, CredentialManager},
     client::RoninApiClient,
     config::{load_config, PermissionMode, RoninConfig},
+    harness::{HarnessKind, HarnessRegistry},
     permissions::PermissionController,
     run::{run_prompt, RunEvent, RunOutcome, RunRequest},
     storage::{
@@ -26,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 #[command(
     name = "ronin",
     version,
-    about = "Ronin coding agent — multi-model agentic work on your Ronin credits"
+    about = "Ronin coding agent — hosted models and official local provider harnesses"
 )]
 struct Cli {
     #[arg(short = 'p', long = "print")]
@@ -59,6 +60,11 @@ enum Commands {
         #[arg(long)]
         tools_only: bool,
     },
+    /// Inspect or authenticate official local agent harnesses
+    Providers {
+        #[command(subcommand)]
+        command: Option<ProviderCommands>,
+    },
     Sessions {
         #[arg(long)]
         all: bool,
@@ -76,6 +82,12 @@ enum Commands {
         dev_user: Option<String>,
     },
     Logout,
+}
+
+#[derive(Subcommand)]
+enum ProviderCommands {
+    /// Run the official provider's login flow
+    Setup { provider: String },
 }
 
 #[derive(Subcommand)]
@@ -178,8 +190,15 @@ async fn run() -> Result<(), String> {
     }
     let config = load_config(&cwd, &home).map_err(|e| e.to_string())?;
     let web_search = config.web_search && !cli.no_web_search;
+    let ronin_credentials = load_credentials_for(&home, &config.api_url);
+    let ronin_authenticated = ronin_credentials.access_token.is_some()
+        || ronin_credentials.refresh_token.is_some()
+        || ronin_credentials.dev_user_id.is_some();
     let manager = Arc::new(CredentialManager::new(&config.api_url, &home));
-    let client = RoninApiClient::new(&config.api_url, manager.clone());
+    let harnesses = Arc::new(HarnessRegistry::new(&home, &cwd, config.permission_mode));
+    let client = RoninApiClient::new(&config.api_url, manager.clone())
+        .with_harnesses(harnesses.clone())
+        .with_hosted_enabled(ronin_authenticated);
     match cli.command {
         Some(Commands::Login { dev_user }) => {
             if let Some(id) = dev_user {
@@ -225,25 +244,47 @@ async fn run() -> Result<(), String> {
         Some(Commands::Doctor) => {
             let mut failed = false;
             println!("Rust: ok ({})", env!("CARGO_PKG_VERSION"));
-            let credentials = load_credentials_for(&home, &config.api_url);
-            if credentials.access_token.is_none() && credentials.dev_user_id.is_none() {
+            let provider_statuses = harnesses.statuses().await;
+            let external_authenticated =
+                provider_statuses.iter().any(|status| status.authenticated);
+            if !ronin_authenticated && !external_authenticated {
                 println!("Credentials: missing");
                 failed = true
+            } else if ronin_authenticated {
+                println!("Ronin credentials: ok")
             } else {
-                println!("Credentials: ok")
+                println!("Ronin credentials: not configured (using local harnesses)")
             }
-            if client.health().await {
+            if ronin_authenticated && client.health().await {
                 println!("API: ok")
-            } else {
+            } else if ronin_authenticated {
                 println!("API: unreachable");
                 failed = true
+            } else {
+                println!("API: skipped")
             }
-            match client.balance().await {
-                Ok(v) => println!("Balance: {}", v.display),
-                Err(e) => {
-                    println!("Balance: {e}");
-                    failed = true
+            if ronin_authenticated {
+                match client.balance().await {
+                    Ok(v) => println!("Balance: {}", v.display),
+                    Err(e) => {
+                        println!("Balance: {e}");
+                        failed = true
+                    }
                 }
+            }
+            for status in provider_statuses {
+                println!(
+                    "Provider {:<8}: {} ({})",
+                    status.kind.id(),
+                    if status.authenticated {
+                        "ready"
+                    } else if status.installed {
+                        "login required"
+                    } else {
+                        "not installed"
+                    },
+                    status.detail
+                );
             }
             match client.models().await {
                 Ok(v) => println!("Models: {} available", v.len()),
@@ -255,6 +296,31 @@ async fn run() -> Result<(), String> {
             println!("Search: native Rust engine");
             if failed {
                 return Err("Doctor found one or more problems.".into());
+            }
+            return Ok(());
+        }
+        Some(Commands::Providers { command }) => {
+            if let Some(ProviderCommands::Setup { provider }) = command {
+                let kind = HarnessKind::parse(&provider).ok_or_else(|| {
+                    "Unknown provider. Expected codex, claude, or opencode.".to_string()
+                })?;
+                harnesses.setup(kind).await?;
+                println!("{} is authenticated.", kind.id());
+            } else {
+                for status in harnesses.statuses().await {
+                    println!(
+                        "{:<8} {:<15} {}",
+                        status.kind.id(),
+                        if status.authenticated {
+                            "ready"
+                        } else if status.installed {
+                            "login required"
+                        } else {
+                            "not installed"
+                        },
+                        status.detail
+                    );
+                }
             }
             return Ok(());
         }
